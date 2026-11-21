@@ -5,7 +5,10 @@ import android.content.*
 import android.content.pm.ServiceInfo
 import android.graphics.*
 import android.os.*
+import android.util.TypedValue
 import android.view.*
+import android.widget.TextView
+import java.util.Calendar
 import kotlin.math.*
 
 val GRID = arrayOf(
@@ -21,17 +24,28 @@ val GRID = arrayOf(
     "..##############..",
 )
 
-class ClawdView(ctx: Context, private val s: Float) : View(ctx) {
+class ClawdView(ctx: Context, private val s: Int) : View(ctx) {
     private val p = Paint().apply { color = Color.rgb(0xd9, 0x77, 0x57) }
+    private val dark = Paint().apply { color = Color.rgb(0x2a, 0x14, 0x0c) }
     var leg = 0
+    var sleep = false
+
+    private fun r(c: Canvas, x: Int, y: Int, w: Int, h: Int, pt: Paint) =
+        c.drawRect(x.toFloat(), y.toFloat(), (x + w).toFloat(), (y + h).toFloat(), pt)
 
     override fun onDraw(c: Canvas) {
-        for (i in GRID.indices) for (j in 0 until 18)
-            if (GRID[i][j] == '#') c.drawRect(j * s, i * s, (j + 1) * s, (i + 1) * s, p)
+        for (i in GRID.indices) for (j in 0 until 18) {
+            val ch = GRID[i][j]
+            if (ch == '#') r(c, j * s, i * s, s, s, p)
+            else if (sleep && (i == 2 || i == 3) && (j == 5 || j == 12)) r(c, j * s, i * s, s, s, p)
+        }
+        if (sleep) {
+            for (j in intArrayOf(5, 12)) r(c, j * s, 3 * s + s / 2, s, max(1, s / 4), dark)
+        }
         val base = intArrayOf(2, 6, 10, 14)
         for (k in 0 until 4) {
             val l = base[k] + if (leg == 1) (if (k % 2 == 0) -1 else 1) else 0
-            c.drawRect(l * s, 10 * s, (l + 2) * s, 12 * s, p)
+            r(c, l * s, 10 * s, 2 * s, 2 * s, p)
         }
     }
 }
@@ -42,12 +56,15 @@ class ClawdService : Service() {
     private lateinit var wm: WindowManager
     private lateinit var view: ClawdView
     private lateinit var lp: WindowManager.LayoutParams
+    private lateinit var zView: TextView
+    private lateinit var zlp: WindowManager.LayoutParams
     private val h = Handler(Looper.getMainLooper())
     private val hist = ArrayList<P>()
 
-    private var k = 1f            // плотность экрана (px на 1 dp)
-    private var G = 0f            // гравитация
-    private var WALK = 0f         // скорость ходьбы
+    private var k = 1f
+    private var s = 3
+    private var G = 0f
+    private var WALK = 0f
     private var sw = 0
     private var sh = 0
     private var sz = 0
@@ -57,13 +74,14 @@ class ClawdService : Service() {
     private var vx = 0f
     private var vy = 0f
     private var dir = 1f
-    private var mode = 1          // 0 ходьба, 1 падение/полет, 2 лазание
+    private var mode = 1          // 0 ходьба, 1 полет/падение, 2 лазание
     private var wall = 0
     private var t = 0
     private var pause = 0
     private var drag = false
     private var ox = 0f
     private var oy = 0f
+    private var asleep = false
     private var floorOff = 0f     // поднять пол, если клодик уходит под панель навигации
 
     private val tick = object : Runnable {
@@ -89,9 +107,9 @@ class ClawdService : Service() {
         sw = dm.widthPixels
         sh = dm.heightPixels
         k = dm.density
-        val s = k * 3f
-        sz = (18 * s).toInt()
-        hh = (12 * s).toInt()
+        s = max(2, (k * 3f).roundToInt())   // целый размер клетки, без швов
+        sz = 18 * s
+        hh = 12 * s
         G = 0.3f * k
         WALK = 0.9f * k
 
@@ -105,6 +123,23 @@ class ClawdService : Service() {
             sz, hh,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP or Gravity.START }
+
+        zView = TextView(this).apply {
+            text = "Z"
+            setTextColor(Color.rgb(0xd8, 0xd8, 0xe8))
+            setTypeface(null, Typeface.BOLD)
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, 14f * k)
+            visibility = View.GONE
+        }
+        zlp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         ).apply { gravity = Gravity.TOP or Gravity.START }
@@ -134,13 +169,13 @@ class ClawdService : Service() {
         }
 
         wm.addView(view, lp)
+        wm.addView(zView, zlp)
         place()
         h.post(tick)
     }
 
-    private fun floor(): Float = sh - hh - floorOff
+    private fun groundY(): Float = sh - hh - floorOff
 
-    // Бросок: скорость по последним точкам движения пальца
     private fun release() {
         if (!drag) return
         drag = false
@@ -159,34 +194,64 @@ class ClawdService : Service() {
         mode = 1
     }
 
+    private fun isNight(): Boolean {
+        val hr = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+        return hr >= 23 || hr < 8
+    }
+
+    private fun startSleep() {
+        if (mode == 2) { mode = 1; vx = 0f; vy = 0f }
+        else if (mode == 0) { mode = 1; vx = 0f; vy = -5.5f * k }  // прыжок перед сном
+    }
+
     private fun step() {
         t++
+        val night = isNight()
+        if (night && !asleep) {
+            asleep = true
+            if (!drag) startSleep()
+        } else if (!night && asleep) {
+            asleep = false
+        }
+
         if (!drag) physics()
-        view.leg = if (mode == 1 || (pause == 0 && (t / 10) % 2 == 1)) 1 else 0
+
+        view.sleep = asleep
+        view.leg = when {
+            asleep -> 0
+            mode == 1 -> 1
+            mode == 0 && pause == 0 && (t / 10) % 2 == 1 -> 1
+            else -> 0
+        }
         view.invalidate()
+
+        val showZ = asleep && !drag && (t % 150) < 100
+        zView.visibility = if (showZ) View.VISIBLE else View.GONE
         place()
     }
 
     private fun physics() {
-        val fl = floor()
+        val gy = groundY()
         val maxX = (sw - sz).toFloat()
         when (mode) {
             0 -> { // ходьба по полу
-                if (pause > 0) pause--
-                else {
-                    x += dir * WALK
-                    val r = Math.random()
-                    if (r < 0.004) pause = (40 + Math.random() * 80).toInt()
-                    else if (r < 0.006) dir = -dir
-                    else if (r < 0.0065) { // маленький прыжок
-                        mode = 1
-                        vy = -5.5f * k
-                        vx = dir * WALK * 1.5f
+                if (!asleep) {
+                    if (pause > 0) pause--
+                    else {
+                        x += dir * WALK
+                        val r = Math.random()
+                        if (r < 0.004) pause = (40 + Math.random() * 80).toInt()
+                        else if (r < 0.006) dir = -dir
+                        else if (r < 0.0065) { // маленький прыжок
+                            mode = 1
+                            vy = -5.5f * k
+                            vx = dir * WALK * 1.5f
+                        }
                     }
+                    if (x <= 0f) { x = 0f; mode = 2; wall = -1 }
+                    if (x >= maxX) { x = maxX; mode = 2; wall = 1 }
                 }
-                if (x <= 0f) { x = 0f; mode = 2; wall = -1 }
-                if (x >= maxX) { x = maxX; mode = 2; wall = 1 }
-                if (mode == 0) y = fl
+                if (mode == 0) y = gy
             }
             2 -> { // лазание по стене вверх
                 y -= 0.8f * k
@@ -197,15 +262,15 @@ class ClawdService : Service() {
                     vy = 0f
                 }
             }
-            else -> { // падение и полет после броска
+            else -> { // падение и полет
                 vy += G
                 x += vx
                 y += vy
                 if (x < 0f) { x = 0f; vx = abs(vx) * 0.6f }
                 if (x > maxX) { x = maxX; vx = -abs(vx) * 0.6f }
                 if (y < 0f) { y = 0f; vy = abs(vy) * 0.4f }
-                if (y >= fl) {
-                    y = fl
+                if (y >= gy) {
+                    y = gy
                     if (vy > 2f * k) vy = -vy * 0.35f   // отскок
                     else {
                         vy = 0f
@@ -226,11 +291,18 @@ class ClawdService : Service() {
         lp.x = x.roundToInt()
         lp.y = y.roundToInt()
         wm.updateViewLayout(view, lp)
+
+        // Z над головой, плавно поднимается
+        val zOff = (t % 150) * 0.1f * k
+        zlp.x = (x + sz * 0.7f).roundToInt()
+        zlp.y = (y - s * 2 - zOff).roundToInt()
+        wm.updateViewLayout(zView, zlp)
     }
 
     override fun onDestroy() {
         h.removeCallbacks(tick)
         wm.removeView(view)
+        wm.removeView(zView)
         super.onDestroy()
     }
 }
