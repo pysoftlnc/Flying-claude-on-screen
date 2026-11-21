@@ -5,6 +5,7 @@ import android.content.*
 import android.content.pm.ServiceInfo
 import android.graphics.*
 import android.os.*
+import android.util.Log
 import android.util.TypedValue
 import android.view.*
 import android.widget.TextView
@@ -60,6 +61,8 @@ class ClawdService : Service() {
     private lateinit var zlp: WindowManager.LayoutParams
     private val h = Handler(Looper.getMainLooper())
     private val hist = ArrayList<P>()
+    private var created = false
+    private var alive = false
 
     private var k = 1f
     private var s = 3
@@ -85,19 +88,36 @@ class ClawdService : Service() {
     private var floorOff = 0f     // поднять пол, если клодик уходит под панель навигации
 
     private val tick = object : Runnable {
-        override fun run() { step(); h.postDelayed(this, 16) }
+        override fun run() {
+            if (!alive) return
+            try {
+                step()
+            } catch (e: Exception) {
+                Log.e("Clawd", "step failed", e)
+            }
+            h.postDelayed(this, 16)
+        }
     }
 
     override fun onBind(i: Intent?): IBinder? = null
 
+    // Система перезапустит сервис после убийства
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+
     override fun onCreate() {
         super.onCreate()
+        if (created) return
+        created = true
+        alive = true
+
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
-            NotificationChannel("c", "Clawd", NotificationManager.IMPORTANCE_MIN))
+            NotificationChannel("c", "Clawd", NotificationManager.IMPORTANCE_LOW))
         val n = Notification.Builder(this, "c")
             .setContentTitle("Clawd")
+            .setContentText("Клодик на экране")
             .setSmallIcon(android.R.drawable.ic_menu_gallery)
+            .setOngoing(true)
             .build()
         if (Build.VERSION.SDK_INT >= 34)
             startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
@@ -300,9 +320,11 @@ class ClawdService : Service() {
     }
 
     override fun onDestroy() {
+        alive = false
         h.removeCallbacks(tick)
-        wm.removeView(view)
-        wm.removeView(zView)
+        try { wm.removeView(view) } catch (e: Exception) { Log.e("Clawd", "remove view", e) }
+        try { wm.removeView(zView) } catch (e: Exception) { Log.e("Clawd", "remove z", e) }
+        created = false
         super.onDestroy()
     }
 }
